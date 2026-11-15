@@ -6,6 +6,9 @@ import numpy as np, pandas as pd
 
 DB = "breakouts.db"
 LOOKBACK, VOL_MULT, STOP_ATR, TARGET_R, MAX_HOLD = 55, 1.5, 2.0, 3.0, 30
+MIN_TURNOVER = 5e7   # skip stocks trading under Rs 5 crore/day (20-day avg)
+RS_DAYS = 126        # relative strength window (~6 months)
+REQUIRE_UPTREND = True  # only take signals when Nifty is above its 200-DMA
 COST = 0.004  # round-trip brokerage + STT + slippage, as fraction of price (tune it)
 
 
@@ -67,16 +70,22 @@ def feats(d):
 
 def scan(prices, nifty):
     regime = (nifty.Close > nifty.Close.rolling(200).mean())
+    nret = nifty.Close.pct_change(RS_DAYS)
     trades, sigs = [], []
     for sym, raw in prices.items():
         d = feats(raw)
         d["regime"] = regime.reindex(d.index).ffill().fillna(False).astype(int)
-        sig = ((d.Close > d.hh) & (d.volr >= VOL_MULT) & (d.Close > d.dma200)).values
+        d["rs"] = d.Close.pct_change(RS_DAYS) - nret.reindex(d.index).ffill()
+        d["turn"] = (d.Close * d.Volume).rolling(20).mean()
+        ok = (d.rs > 0) & (d.turn >= MIN_TURNOVER)
+        if REQUIRE_UPTREND:
+            ok &= d.regime == 1
+        sig = ((d.Close > d.hh) & (d.volr >= VOL_MULT) & (d.Close > d.dma200) & ok).values
         O, H, L, C = (d[x].values for x in ("Open", "High", "Low", "Close"))
         n = len(d)
         for i in np.flatnonzero(sig):
             row = dict(symbol=sym, date=d.index[i].strftime("%Y-%m-%d"), volr=d.volr.iat[i],
-                       atrp=d.atrp.iat[i], dist200=d.dist200.iat[i], regime=int(d.regime.iat[i]))
+                       atrp=d.atrp.iat[i], dist200=d.dist200.iat[i], rs=d.rs.iat[i] * 100, regime=int(d.regime.iat[i]))
             if i == n - 1:  # today's live signal: entry unknown until tomorrow's open
                 e = C[i]; s = e - STOP_ATR * d.atr.iat[i]
                 sigs.append({**row, "entry": e, "stop": s, "target": e + TARGET_R * (e - s)})
@@ -137,6 +146,9 @@ def run_scan(demo=False):
         nifty = yf.download("^NSEI", period="10y", auto_adjust=True, progress=False)
         nifty.columns = [c[0] if isinstance(c, tuple) else c for c in nifty.columns]
     trades, sigs = scan(prices, nifty)
+    cols = ["symbol", "date", "volr", "atrp", "dist200", "rs", "regime", "entry", "stop", "target"]
+    if sigs.empty:  # quiet day: keep the table's columns so saving and the dashboard still work
+        sigs = pd.DataFrame(columns=cols)
     with sqlite3.connect(DB) as con:
         trades.to_sql("trades", con, if_exists="replace", index=False)
         sigs.to_sql("signals", con, if_exists="replace", index=False)
